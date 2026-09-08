@@ -2240,7 +2240,7 @@ def int_amdgcn_buffer_inv :
   DefaultAttrsIntrinsic<[], [llvm_i32_ty],
                         [ImmArg<ArgIndex<0>>,
                          RangeSet<ArgIndex<0>, [[0, 1], [16, 17]]>,
-                         IntrNoMem, IntrHasSideEffects]>;
+                         IntrNoMem, IntrHasSideEffects, IntrConvergent]>;
 
 def int_amdgcn_s_dcache_inv :
   ClangBuiltin<"__builtin_amdgcn_s_dcache_inv">,
