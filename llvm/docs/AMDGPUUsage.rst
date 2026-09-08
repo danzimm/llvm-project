@@ -11250,6 +11250,10 @@ For GFX942:
     between wavefronts executing in different work-groups as they may be
     executing on different CUs.
 
+  * The ``llvm.amdgcn.buffer.inv`` intrinsic and
+    ``__builtin_amdgcn_buffer_inv`` builtin encode no cache policy flags as 0,
+    ``sc0`` as 1, and ``sc1`` as 16; the values can be combined.
+
   * Atomic read-modify-write instructions implicitly bypass the L1 cache.
     Therefore, they do not use the sc0 bit for coherence and instead use it to
     indicate if the instruction returns the original value being updated. They
