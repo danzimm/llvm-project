@@ -322,6 +322,27 @@ def ROCDL_SWaitcntOp : ROCDL_ConcreteNonMemIntrOp<"s.waitcnt", [], 0, [0], ["bit
   }];
 }
 
+def ROCDL_BufferInvOp :
+  ROCDL_ConcreteNonMemIntrOp<"buffer.inv", [], 0, [0], ["cpol"]>,
+  Arguments<(ins ROCDL_Gfx942CachePolicyAttr:$cpol)> {
+  let summary = "Invalidate vector caches";
+  let description = [{
+    Invalidate vector caches according to the cache-policy flags. `sc0`
+    invalidates the vector L1 cache and `sc1` invalidates the non-local L2
+    cache; the flags can be combined. With `none`, no cache is invalidated,
+    but the operation still increments `VM_CNT` and can be used to align its
+    value across control-flow paths.
+
+    This operation requires the `gfx940-insts` target feature.
+
+    Example:
+    ```mlir
+    rocdl.buffer.inv sc0|sc1
+    ```
+  }];
+  let assemblyFormat = "enum($cpol) attr-dict";
+}
+
 def ROCDL_SSleepOp : ROCDL_ConcreteNonMemIntrOp<"s.sleep", [], 0, [0], ["count"]>,
   Arguments<(ins I32Attr:$count)> {
   let assemblyFormat = "attr-dict $count";
