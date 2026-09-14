@@ -11243,6 +11243,13 @@ For GFX942:
     between wavefronts executing in different work-groups as they may be
     executing on different CUs.
 
+  * A ``buffer_inv`` with neither ``sc0`` nor ``sc1`` set does not invalidate
+    any cache. It still increments ``VM_CNT``, so it can be used as a no-op to
+    align ``VM_CNT`` values across control-flow paths.
+    The ``llvm.amdgcn.buffer.inv`` intrinsic and
+    ``__builtin_amdgcn_buffer_inv`` builtin encode ``sc0`` as 1 and ``sc1`` as
+    16; the values can be combined.
+
   * Atomic read-modify-write instructions implicitly bypass the L1 cache.
     Therefore, they do not use the sc0 bit for coherence and instead use it to
     indicate if the instruction returns the original value being updated. They
