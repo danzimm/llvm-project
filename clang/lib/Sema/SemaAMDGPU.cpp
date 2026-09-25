@@ -168,6 +168,18 @@ bool SemaAMDGPU::CheckAMDGCNBuiltinFunctionCall(const TargetInfo &TI,
   case AMDGPU::BI__builtin_amdgcn_s_setreg:
     return SemaRef.BuiltinConstantArgRange(TheCall, /*ArgNum=*/0, /*Low=*/0,
                                            /*High=*/UINT16_MAX);
+  case AMDGPU::BI__builtin_amdgcn_buffer_inv: {
+    llvm::APSInt CPol;
+    if (SemaRef.BuiltinConstantArg(TheCall, /*ArgNum=*/0, CPol))
+      return true;
+
+    // BUFFER_INV only supports the SC0 and SC1 cache-policy bits.
+    if ((CPol.getZExtValue() & ~0x11u) != 0)
+      return Diag(TheCall->getArg(0)->getExprLoc(),
+                  diag::err_amdgcn_buffer_inv_invalid_cpol)
+             << TheCall->getArg(0)->getSourceRange();
+    return false;
+  }
   case AMDGPU::BI__builtin_amdgcn_s_wait_event: {
     llvm::APSInt Result;
     if (SemaRef.BuiltinConstantArg(TheCall, 0, Result))
