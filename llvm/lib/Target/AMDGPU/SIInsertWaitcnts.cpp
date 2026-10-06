@@ -138,6 +138,10 @@ static bool updateVMCntOnly(const MachineInstr &Inst) {
          SIInstrInfo::isFLATGlobal(Inst) || SIInstrInfo::isFLATScratch(Inst);
 }
 
+static bool subtargetSupportsWaitcntPadding(const GCNSubtarget &ST) {
+  return ST.hasBufferInvInst();
+}
+
 #ifndef NDEBUG
 static bool isNormalMode(AMDGPU::InstCounterType MaxCounter) {
   return MaxCounter == AMDGPU::NUM_NORMAL_INST_CNTS;
@@ -466,6 +470,12 @@ public:
   AMDGPU::InstCounterType getCounterFromEvent(HWEvents E) const {
     return WCG->getCounterFromEvent(E);
   }
+
+private:
+  /// Return true if:
+  /// - \p Join is preceded by either a triangle or a diamond CFG pattern,
+  /// - The branch, its arms, and \p Join are all in the same innermost loop.
+  bool isBranchPaddingEligible(const MachineBasicBlock &Join) const;
 };
 
 // This objects maintains the current score brackets of each wait counter, and
@@ -3447,6 +3457,42 @@ SIInsertWaitcnts::getPreheaderFlushFlags(MachineLoop *ML,
   return Flags;
 }
 
+bool SIInsertWaitcnts::isBranchPaddingEligible(
+    const MachineBasicBlock &Join) const {
+  if (Join.pred_size() != 2)
+    return false;
+
+  MachineLoop *Loop = MLI.getLoopFor(&Join);
+  if (Loop && (Loop->getHeader() == &Join || Loop->isLoopLatch(&Join)))
+    return false;
+
+  auto Pred = Join.pred_begin();
+  MachineBasicBlock *A = *Pred++;
+  MachineBasicBlock *B = *Pred;
+
+  // Return the branch point for a single-entry, single-exit arm into Join.
+  auto GetArmPredecessor = [&](MachineBasicBlock *MBB) -> MachineBasicBlock * {
+    return MBB->getSingleSuccessor() == &Join ? MBB->getSinglePredecessor()
+                                              : nullptr;
+  };
+
+  MachineBasicBlock *PredA = GetArmPredecessor(A);
+  MachineBasicBlock *PredB = GetArmPredecessor(B);
+  MachineBasicBlock *Branch = nullptr;
+  // Triangle
+  if (PredA == B || PredB == A)
+    Branch = PredA == B ? B : A;
+  // Diamond
+  else if (PredA && PredA == PredB)
+    Branch = PredA;
+
+  if (!Branch || Branch->succ_size() != 2)
+    return false;
+
+  return MLI.getLoopFor(Branch) == Loop && MLI.getLoopFor(A) == Loop &&
+         MLI.getLoopFor(B) == Loop;
+}
+
 bool SIInsertWaitcntsLegacy::runOnMachineFunction(MachineFunction &MF) {
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   auto &PDT =
@@ -3560,6 +3606,8 @@ bool SIInsertWaitcnts::run() {
   for (auto *MBB : ReversePostOrderTraversal<MachineFunction *>(&MF))
     BlockInfos.try_emplace(MBB);
 
+  const bool CanPadBranches =
+      !WCG->isOptNone() && subtargetSupportsWaitcntPadding(ST);
   std::unique_ptr<WaitcntBrackets> Brackets;
   bool Repeat;
   do {
@@ -3618,6 +3666,14 @@ bool SIInsertWaitcnts::run() {
               Succ->printName(dbgs());
               dbgs() << '\n';
             });
+            if (CanPadBranches && isBranchPaddingEligible(*Succ)) {
+              LLVM_DEBUG({
+                dbgs() << "Waitcnt branch padding eligible join ";
+                Succ->printName(dbgs());
+                dbgs() << '\n';
+              });
+              // TODO: Balance LOAD_CNT histories before merging.
+            }
             if (SuccBI.Incoming->merge(*Brackets)) {
               SuccBI.Dirty = true;
               if (SuccBII <= BII) {
