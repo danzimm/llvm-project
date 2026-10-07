@@ -138,10 +138,6 @@ static bool updateVMCntOnly(const MachineInstr &Inst) {
          SIInstrInfo::isFLATGlobal(Inst) || SIInstrInfo::isFLATScratch(Inst);
 }
 
-static bool subtargetSupportsWaitcntPadding(const GCNSubtarget &ST) {
-  return ST.hasBufferInvInst();
-}
-
 #ifndef NDEBUG
 static bool isNormalMode(AMDGPU::InstCounterType MaxCounter) {
   return MaxCounter == AMDGPU::NUM_NORMAL_INST_CNTS;
@@ -350,6 +346,9 @@ struct PreheaderFlushFlags {
   bool FlushDsCnt = false;
 };
 
+/// Maps each counter to its padding opcode, or zero if it cannot be padded.
+using CounterPaddingMap = std::array<unsigned, AMDGPU::NUM_INST_CNTS>;
+
 class SIInsertWaitcnts {
   DenseMap<const Value *, MachineBasicBlock *> SLoadAddresses;
   DenseMap<MachineBasicBlock *, PreheaderFlushFlags> PreheadersToFlush;
@@ -357,6 +356,7 @@ class SIInsertWaitcnts {
   MachinePostDominatorTree &PDT;
   AliasAnalysis *AA = nullptr;
   MachineFunction &MF;
+  CounterPaddingMap CounterPadding = {};
 
   struct BlockInfo {
     std::unique_ptr<WaitcntBrackets> Incoming;
@@ -472,6 +472,13 @@ public:
   }
 
 private:
+  /// Initialize the per-counter padding opcodes supported by the subtarget.
+  /// Return true if any counter can be padded.
+  bool initializeCounterPadding();
+  MachineInstr *emitPadding(AMDGPU::InstCounterType T, MachineBasicBlock &MBB,
+                            MachineBasicBlock::iterator InsertPt,
+                            const DebugLoc &DL) const;
+
   /// Return true if:
   /// - \p Join is preceded by either a triangle or a diamond CFG pattern,
   /// - The branch, its arms, and \p Join are all in the same innermost loop.
@@ -3457,6 +3464,30 @@ SIInsertWaitcnts::getPreheaderFlushFlags(MachineLoop *ML,
   return Flags;
 }
 
+bool SIInsertWaitcnts::initializeCounterPadding() {
+  bool CanPad = false;
+  if (ST.hasBufferInvInst()) {
+    CounterPadding[AMDGPU::LOAD_CNT] = AMDGPU::BUFFER_INV;
+    CanPad = true;
+  }
+
+  return CanPad;
+}
+
+MachineInstr *
+SIInsertWaitcnts::emitPadding(AMDGPU::InstCounterType T, MachineBasicBlock &MBB,
+                              MachineBasicBlock::iterator InsertPt,
+                              const DebugLoc &DL) const {
+  switch (CounterPadding[T]) {
+  case AMDGPU::BUFFER_INV:
+    return BuildMI(MBB, InsertPt, DL, TII.get(AMDGPU::BUFFER_INV))
+        .addImm(0)
+        .getInstr();
+  default:
+    llvm_unreachable("unsupported waitcnt padding instruction");
+  }
+}
+
 bool SIInsertWaitcnts::isBranchPaddingEligible(
     const MachineBasicBlock &Join) const {
   if (Join.pred_size() != 2)
@@ -3549,6 +3580,7 @@ bool SIInsertWaitcnts::run() {
   }
 
   SmemAccessCounter = getCounterFromEvent(HWEvents::SMEM_ACCESS);
+  const bool CanPadBranches = !WCG->isOptNone() && initializeCounterPadding();
 
   bool Modified = false;
 
@@ -3606,8 +3638,6 @@ bool SIInsertWaitcnts::run() {
   for (auto *MBB : ReversePostOrderTraversal<MachineFunction *>(&MF))
     BlockInfos.try_emplace(MBB);
 
-  const bool CanPadBranches =
-      !WCG->isOptNone() && subtargetSupportsWaitcntPadding(ST);
   std::unique_ptr<WaitcntBrackets> Brackets;
   bool Repeat;
   do {
@@ -3672,7 +3702,7 @@ bool SIInsertWaitcnts::run() {
                 Succ->printName(dbgs());
                 dbgs() << '\n';
               });
-              // TODO: Balance LOAD_CNT histories before merging.
+              // TODO: Balance waitcnt histories before merging.
             }
             if (SuccBI.Incoming->merge(*Brackets)) {
               SuccBI.Dirty = true;
