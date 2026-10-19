@@ -495,6 +495,19 @@ private:
 // "s_waitcnt 0" before use.
 class WaitcntBrackets {
 public:
+  struct PaddingOpportunity {
+    /// Number of padding instructions needed to balance the counter.
+    unsigned Amount = 0;
+    /// True to pad the Other merge operand; false to pad the receiving operand.
+    bool PadOther = false;
+  };
+
+  struct MergeResult {
+    bool StrictDom = false;
+    /// Per-counter opportunities. An amount of zero means no opportunity.
+    std::array<PaddingOpportunity, AMDGPU::NUM_INST_CNTS> Padding{};
+  };
+
   WaitcntBrackets(const SIInsertWaitcnts *Context) : Context(Context) {
     assert(Context->TRI.getNumRegUnits() < REGUNITS_END);
   }
@@ -569,7 +582,8 @@ public:
     assert(getScoreUB(AMDGPU::VA_VDST_RD) == getScoreUB(AMDGPU::VA_VDST_WR));
   }
 
-  bool merge(const WaitcntBrackets &Other);
+  MergeResult merge(const WaitcntBrackets &Other,
+                    const CounterPaddingMap *PaddingOpcodes = nullptr);
 
   bool counterOutOfOrder(AMDGPU::InstCounterType T) const;
   void simplifyWaitcnt(AMDGPU::Waitcnt &Wait) const {
@@ -2877,12 +2891,22 @@ bool WaitcntBrackets::mergeAsyncMarks(ArrayRef<MergeInfo> MergeInfos,
   return StrictDom;
 }
 
-/// Merge the pending events and associater score brackets of \p Other into
-/// this brackets status.
+/// Merge the pending events and associated score brackets of \p Other into
+/// this bracket state. If \p PaddingOpcodes is non-null, also report
+/// imbalances for counters that have a padding opcode without changing the
+/// merged state.
 ///
-/// Returns whether the merge resulted in a change that requires tighter waits
-/// (i.e. the merged brackets strictly dominate the original brackets).
-bool WaitcntBrackets::merge(const WaitcntBrackets &Other) {
+/// MergeResult::StrictDom reports whether the merge requires tighter waits.
+///
+/// MergeResult::Padding specifies padding that should be inserted to balance
+/// the specified wait counters. For example when buffer_inv is available
+/// it's used to balance LOAD_CNT between this and \p Other.
+///
+/// Balancing here means relaxing the required waitcnt after merging brackets.
+WaitcntBrackets::MergeResult
+WaitcntBrackets::merge(const WaitcntBrackets &Other,
+                       const CounterPaddingMap *PaddingOpcodes) {
+  MergeResult Result;
   bool StrictDom = false;
 
   // Check if "other" has keys we don't have, and create default entries for
@@ -2905,8 +2929,15 @@ bool WaitcntBrackets::merge(const WaitcntBrackets &Other) {
     PendingEvents |= OtherEvents;
 
     // Merge scores for this counter
-    const unsigned MyPending = ScoreUBs[T] - ScoreLBs[T];
-    const unsigned OtherPending = Other.ScoreUBs[T] - Other.ScoreLBs[T];
+    const unsigned MyPending = getOutstanding(T);
+    const unsigned OtherPending = Other.getOutstanding(T);
+    if (PaddingOpcodes && (*PaddingOpcodes)[T] && MyPending != OtherPending) {
+      PaddingOpportunity &Opportunity = Result.Padding[T];
+      Opportunity.PadOther = OtherPending < MyPending;
+      Opportunity.Amount = Opportunity.PadOther ? MyPending - OtherPending
+                                                : OtherPending - MyPending;
+      // TODO: Actually update the scorecard to include padding.
+    }
     const unsigned NewUB = ScoreLBs[T] + std::max(MyPending, OtherPending);
     if (NewUB < ScoreLBs[T])
       report_fatal_error("waitcnt score overflow");
@@ -2964,7 +2995,8 @@ bool WaitcntBrackets::merge(const WaitcntBrackets &Other) {
     StrictDom |= mergeScore(MergeInfos[T], AsyncScore[T], Other.AsyncScore[T]);
 
   purgeEmptyTrackingData();
-  return StrictDom;
+  Result.StrictDom = StrictDom;
+  return Result;
 }
 
 static bool isWaitInstr(MachineInstr &Inst) {
@@ -3580,7 +3612,7 @@ bool SIInsertWaitcnts::run() {
   }
 
   SmemAccessCounter = getCounterFromEvent(HWEvents::SMEM_ACCESS);
-  const bool CanPadBranches = !WCG->isOptNone() && initializeCounterPadding();
+  bool ShouldPadBranches = !WCG->isOptNone() && initializeCounterPadding();
 
   bool Modified = false;
 
@@ -3672,7 +3704,7 @@ bool SIInsertWaitcnts::run() {
       Modified |= insertWaitcntInBlock(MF, *MBB, *Brackets);
       BI.Dirty = false;
 
-      if (Brackets->hasPendingEvent()) {
+      if (Brackets->hasPendingEvent() || ShouldPadBranches) {
         BlockInfo *MoveBracketsToSucc = nullptr;
         for (MachineBasicBlock *Succ : MBB->successors()) {
           auto *SuccBII = BlockInfos.find(Succ);
@@ -3696,15 +3728,46 @@ bool SIInsertWaitcnts::run() {
               Succ->printName(dbgs());
               dbgs() << '\n';
             });
-            if (CanPadBranches && isBranchPaddingEligible(*Succ)) {
+            const CounterPaddingMap *PaddingMap = nullptr;
+            // TODO: Since this is only true on first iter of Repeat loop,
+            // the event counts in merge() may be incorrect. E.g. if there's
+            // a loop carried event within one of the arms.
+            if (ShouldPadBranches && isBranchPaddingEligible(*Succ)) {
+              PaddingMap = &CounterPadding;
               LLVM_DEBUG({
                 dbgs() << "Waitcnt branch padding eligible join ";
                 Succ->printName(dbgs());
                 dbgs() << '\n';
               });
-              // TODO: Balance waitcnt histories before merging.
             }
-            if (SuccBI.Incoming->merge(*Brackets)) {
+            WaitcntBrackets::MergeResult Merge =
+                SuccBI.Incoming->merge(*Brackets, PaddingMap);
+            if (PaddingMap) {
+              LLVM_DEBUG({
+                MachineBasicBlock *ReceivingMBB = nullptr;
+                for (MachineBasicBlock *Pred : Succ->predecessors()) {
+                  if (Pred != MBB) {
+                    ReceivingMBB = Pred;
+                    break;
+                  }
+                }
+                assert(ReceivingMBB && "expected the other predecessor");
+                for (auto T : inst_counter_types(MaxCounter)) {
+                  const auto &Opportunity = Merge.Padding[T];
+                  if (!Opportunity.Amount)
+                    continue;
+                  MachineBasicBlock *PadPred =
+                      Opportunity.PadOther ? MBB : ReceivingMBB;
+                  dbgs() << "Waitcnt branch padding opportunity: pad edge ";
+                  PadPred->printName(dbgs());
+                  dbgs() << " -> ";
+                  Succ->printName(dbgs());
+                  dbgs() << " by " << Opportunity.Amount << " for "
+                         << AMDGPU::getInstCounterName(T) << '\n';
+                }
+              });
+            }
+            if (Merge.StrictDom) {
               SuccBI.Dirty = true;
               if (SuccBII <= BII) {
                 LLVM_DEBUG(dbgs() << "Repeat on backedge with merge\n");
@@ -3717,6 +3780,9 @@ bool SIInsertWaitcnts::run() {
           MoveBracketsToSucc->Incoming = std::move(Brackets);
       }
     }
+    // Only pad branches on first iteration, otherwise branches within loop will
+    // gain superfluous pads.
+    ShouldPadBranches = false;
   } while (Repeat);
 
   Modified |= WCG->eraseDeferredWaitcnts();
