@@ -30,6 +30,8 @@
 #include "SIMachineFunctionInfo.h"
 #include "Utils/AMDGPUBaseInfo.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
+#include "llvm/CodeGen/MachineDomTreeUpdater.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachinePassManager.h"
@@ -37,6 +39,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/TargetParser/AMDGPUTargetParser.h"
+#include <optional>
 
 using namespace llvm;
 
@@ -126,6 +129,126 @@ static bool isNonWaitcntMetaInst(const MachineInstr &MI) {
   default:
     return MI.isMetaInstruction();
   }
+}
+
+// Match the asyncmark history cap used when merging score brackets. This
+// analysis only asks whether a wait could select an inherited checkpoint;
+// the normal waitcnt analysis determines its completion requirements.
+static constexpr unsigned AsyncmarkHistoryLimit = 16;
+
+static unsigned countRemainingAsyncmarks(const MachineBasicBlock &MBB,
+                                         unsigned Count) {
+  for (const MachineInstr &MI : MBB) {
+    if (MI.getOpcode() == AMDGPU::ASYNCMARK)
+      Count = std::min(Count + 1, AsyncmarkHistoryLimit);
+    else if (MI.getOpcode() == AMDGPU::WAIT_ASYNCMARK)
+      Count = std::min(Count, unsigned(MI.getOperand(0).getImm()));
+  }
+  return Count;
+}
+
+// A maximum over paths deliberately admits possible inherited history, rather
+// than requiring a single static ASYNCMARK to dominate the branch. In
+// particular, an asyncmark in a loop's suffix can be inherited on the next
+// iteration. Saturating before a wait with N >= 16 can overestimate the
+// remaining history; candidate waits below the cap use the usual recency
+// interpretation.
+static DenseSet<MachineBasicBlock *>
+findAsyncmarkPaddingHeaders(MachineFunction &MF) {
+  DenseMap<MachineBasicBlock *, unsigned> IncomingMarks;
+  SmallVector<MachineBasicBlock *> Worklist{&MF.front()};
+  IncomingMarks[&MF.front()] = 0;
+  while (!Worklist.empty()) {
+    MachineBasicBlock *MBB = Worklist.pop_back_val();
+    unsigned Count = countRemainingAsyncmarks(*MBB, IncomingMarks.lookup(MBB));
+    for (MachineBasicBlock *Succ : MBB->successors()) {
+      auto [It, Inserted] = IncomingMarks.try_emplace(Succ, Count);
+      if (Inserted || Count > It->second) {
+        It->second = Count;
+        Worklist.push_back(Succ);
+      }
+    }
+  }
+
+  struct NextWait {
+    const MachineInstr *MI;
+    unsigned NewMarks;
+  };
+  DenseSet<MachineBasicBlock *> Headers;
+  for (MachineBasicBlock &Header : MF) {
+    if (Header.succ_size() != 2 || !IncomingMarks.contains(&Header))
+      continue;
+    unsigned InheritedMarks =
+        countRemainingAsyncmarks(Header, IncomingMarks.lookup(&Header));
+    if (!InheritedMarks)
+      continue;
+
+    // Scan only to a common first async wait. Entering a block before its
+    // result is known detects a cycle before that wait and rejects the
+    // corridor.
+    DenseMap<MachineBasicBlock *, std::optional<NextWait>> NextWaits;
+    NextWaits[&Header] = std::nullopt;
+    auto FindWait = [&](auto &&Self,
+                        MachineBasicBlock *MBB) -> std::optional<NextWait> {
+      auto [It, Inserted] = NextWaits.try_emplace(MBB, std::nullopt);
+      if (!Inserted)
+        return It->second;
+
+      unsigned NewMarks = 0;
+      for (const MachineInstr &MI : *MBB) {
+        if (MI.getOpcode() == AMDGPU::ASYNCMARK) {
+          if (++NewMarks == AsyncmarkHistoryLimit)
+            return std::nullopt;
+        } else if (MI.getOpcode() == AMDGPU::WAIT_ASYNCMARK) {
+          return NextWaits[MBB] = NextWait{&MI, NewMarks};
+        }
+      }
+
+      std::optional<NextWait> Result;
+      for (MachineBasicBlock *Succ : MBB->successors()) {
+        auto Other = Self(Self, Succ);
+        if (!Other || (Result && (Other->MI != Result->MI ||
+                                  Other->NewMarks != Result->NewMarks)))
+          return std::nullopt;
+        Result = Other;
+      }
+      if (!Result || Result->NewMarks + NewMarks >= AsyncmarkHistoryLimit)
+        return std::nullopt;
+      Result->NewMarks += NewMarks;
+      return NextWaits[MBB] = Result;
+    };
+
+    std::optional<NextWait> Wait;
+    bool Supported = true;
+    for (MachineBasicBlock *Succ : Header.successors()) {
+      auto Other = FindWait(FindWait, Succ);
+      if (!Other || (Wait && (Other->MI != Wait->MI ||
+                              Other->NewMarks != Wait->NewMarks))) {
+        Supported = false;
+        break;
+      }
+      Wait = Other;
+    }
+    if (!Supported)
+      continue;
+
+    // No outside path may introduce a different marker count before the wait.
+    for (const auto &[MBB, Result] : NextWaits) {
+      if (MBB == &Header)
+        continue;
+      for (MachineBasicBlock *Pred : MBB->predecessors())
+        Supported &= NextWaits.contains(Pred);
+    }
+    if (!Supported)
+      continue;
+
+    unsigned N = Wait->MI->getOperand(0).getImm();
+    if (N >= AsyncmarkHistoryLimit || N < Wait->NewMarks)
+      continue;
+    if (InheritedMarks > N - Wait->NewMarks)
+      Headers.insert(&Header);
+  }
+  return Headers;
 }
 
 static bool updateVMCntOnly(const MachineInstr &Inst) {
@@ -346,11 +469,13 @@ class SIInsertWaitcnts {
   DenseMap<MachineBasicBlock *, PreheaderFlushFlags> PreheadersToFlush;
   MachineLoopInfo &MLI;
   MachinePostDominatorTree &PDT;
+  MachineDominatorTree *MDT;
   AliasAnalysis *AA = nullptr;
   MachineFunction &MF;
 
   struct BlockInfo {
     std::unique_ptr<WaitcntBrackets> Incoming;
+    MachineBasicBlock *FirstIncomingPred = nullptr;
     bool Dirty = true;
     BlockInfo() = default;
     BlockInfo(BlockInfo &&) = default;
@@ -359,6 +484,13 @@ class SIInsertWaitcnts {
   };
 
   MapVector<MachineBasicBlock *, BlockInfo> BlockInfos;
+
+  // Keep the CFG unchanged during convergence. A padding choice is made only
+  // on the first sweep, but its instruction transfer is applied on every
+  // subsequent visit to the edge. Materialize these edges after solving.
+  MapVector<std::pair<MachineBasicBlock *, MachineBasicBlock *>, unsigned>
+      EdgePadding;
+  DenseSet<MachineBasicBlock *> AsyncmarkPaddingHeaders;
 
   bool ForceEmitWaitcnt[AMDGPU::NUM_INST_CNTS] = {};
 
@@ -386,10 +518,11 @@ public:
   const bool TgSplit;
 
   SIInsertWaitcnts(MachineLoopInfo &MLI, MachinePostDominatorTree &PDT,
-                   AliasAnalysis *AA, MachineFunction &MF)
-      : MLI(MLI), PDT(PDT), AA(AA), MF(MF), ST(MF.getSubtarget<GCNSubtarget>()),
-        TII(*ST.getInstrInfo()), TRI(TII.getRegisterInfo()),
-        MRI(MF.getRegInfo()),
+                   MachineDominatorTree *MDT, AliasAnalysis *AA,
+                   MachineFunction &MF)
+      : MLI(MLI), PDT(PDT), MDT(MDT), AA(AA), MF(MF),
+        ST(MF.getSubtarget<GCNSubtarget>()), TII(*ST.getInstrInfo()),
+        TRI(TII.getRegisterInfo()), MRI(MF.getRegInfo()),
         TgSplit(ST.hasTgSplitSupport() &&
                 AMDGPU::isTgSplitEnabled(MF.getFunction())) {}
 
@@ -467,6 +600,9 @@ public:
   /// - VMcnt/LOADcnt is zero'd if there are any non-VMEM_INV events
   AMDGPU::Waitcnt
   getFunctionReturnWaitcnt(const WaitcntBrackets &ScoreBrackets) const;
+  bool isBranchPaddingEligible(const MachineBasicBlock &Join) const;
+  void applyCounterPadding(WaitcntBrackets &Brackets, unsigned Amount);
+  bool materializeCounterPadding();
 };
 
 // This objects maintains the current score brackets of each wait counter, and
@@ -841,7 +977,7 @@ private:
   // without waiting on any mark can cause AsyncMarks to grow very large. We cap
   // it to a reasonable limit. We can tune this later or potentially introduce a
   // user option to control the value.
-  static constexpr unsigned MaxAsyncMarks = 16;
+  static constexpr unsigned MaxAsyncMarks = AsyncmarkHistoryLimit;
 
   // Track the upper bound score for async operations that are not part of a
   // mark yet. Initialized to all zeros.
@@ -869,9 +1005,13 @@ public:
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
-    AU.setPreservesCFG();
     AU.addRequired<MachineLoopInfoWrapperPass>();
     AU.addRequired<MachinePostDominatorTreeWrapperPass>();
+    AU.addUsedIfAvailable<MachineDominatorTreeWrapperPass>();
+    AU.addPreserved<MachineDominatorTreeWrapperPass>();
+    AU.addPreserved<MachineLoopInfoWrapperPass>();
+    AU.addPreserved<MachinePostDominatorTreeWrapperPass>();
+    AU.addPreserved<MachineBranchProbabilityInfoWrapperPass>();
     AU.addUsedIfAvailable<AAResultsWrapperPass>();
     AU.addPreserved<AAResultsWrapperPass>();
     MachineFunctionPass::getAnalysisUsage(AU);
@@ -3470,15 +3610,112 @@ SIInsertWaitcnts::getPreheaderFlushFlags(MachineLoop *ML,
   return Flags;
 }
 
+bool SIInsertWaitcnts::isBranchPaddingEligible(
+    const MachineBasicBlock &Join) const {
+  if (Join.pred_size() != 2 || Join.isEHPad())
+    return false;
+
+  MachineLoop *Loop = MLI.getLoopFor(&Join);
+  if (Loop && (Loop->getHeader() == &Join || Loop->isLoopLatch(&Join)))
+    return false;
+
+  auto Pred = Join.pred_begin();
+  MachineBasicBlock *A = *Pred++;
+  MachineBasicBlock *B = *Pred;
+  auto GetArmPredecessor = [&](MachineBasicBlock *Arm) {
+    return Arm->getSingleSuccessor() == &Join ? Arm->getSinglePredecessor()
+                                              : nullptr;
+  };
+  MachineBasicBlock *PredA = GetArmPredecessor(A);
+  MachineBasicBlock *PredB = GetArmPredecessor(B);
+  MachineBasicBlock *Branch = nullptr;
+  if (PredA == B || PredB == A)
+    Branch = PredA == B ? B : A;
+  else if (PredA && PredA == PredB)
+    Branch = PredA;
+
+  if (!Branch || Branch->succ_size() != 2 || MLI.getLoopFor(Branch) != Loop ||
+      MLI.getLoopFor(A) != Loop || MLI.getLoopFor(B) != Loop)
+    return false;
+
+  // Only split ordinary direct branches. The nonempty condition also excludes
+  // two-successor blocks whose transfer is not represented by a conditional
+  // branch that can be retargeted.
+  MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
+  SmallVector<MachineOperand, 4> Cond;
+  if (TII.analyzeBranch(*Branch, TBB, FBB, Cond) || Cond.empty())
+    return false;
+  if ((Branch == A || Branch == B) &&
+      !Branch->canSplitCriticalEdge(&Join, &MLI))
+    return false;
+
+  for (MachineBasicBlock *Arm : {A, B}) {
+    if (Arm == Branch)
+      continue;
+    for (const MachineInstr &MI : Arm->terminators())
+      if (MI.getOpcode() != AMDGPU::S_BRANCH)
+        return false;
+  }
+  return AsyncmarkPaddingHeaders.contains(Branch);
+}
+
+void SIInsertWaitcnts::applyCounterPadding(WaitcntBrackets &Brackets,
+                                           unsigned Amount) {
+  // Use the same instruction/event transfer as physical padding. BUFFER_INV
+  // has no address or destination registers and does not create a new async
+  // checkpoint. It only advances the LOAD counter's event timeline.
+  MachineInstr *Pad =
+      BuildMI(MF, DebugLoc(), TII.get(AMDGPU::BUFFER_INV)).addImm(0).getInstr();
+  for (unsigned I = 0; I != Amount; ++I)
+    updateEventWaitcntAfter(*Pad, &Brackets);
+  MF.deleteMachineInstr(Pad);
+}
+
+bool SIInsertWaitcnts::materializeCounterPadding() {
+  MachineDomTreeUpdater DTU(MDT, &PDT,
+                            MachineDomTreeUpdater::UpdateStrategy::Eager);
+  for (const auto &[Edge, Amount] : EdgePadding) {
+    MachineBasicBlock *Pred = Edge.first;
+    MachineBasicBlock *Join = Edge.second;
+    MachineBasicBlock *PadBlock = Pred;
+    DebugLoc DL = Pred->findBranchDebugLoc();
+
+    if (Pred->succ_size() != 1) {
+      bool WasLayoutEdge = Pred->isLayoutSuccessor(Join);
+      MachineBasicBlock::SplitCriticalEdgeAnalyses Analyses{};
+      Analyses.MLI = &MLI;
+      PadBlock = Pred->SplitCriticalEdge(Join, Analyses, &DTU);
+      assert(PadBlock && "eligible padding edge must remain splittable");
+      PadBlock->setSectionID(Pred->getSectionID());
+      if (!WasLayoutEdge) {
+        // The splitter updates the cached trees, loop membership, live-ins,
+        // and edge probabilities. Keep taken-edge padding out of line and
+        // repair the predecessor's original fallthrough after moving it.
+        MF.splice(MF.end(), PadBlock);
+        Pred->updateTerminator(PadBlock);
+      }
+    }
+
+    PadBlock->addLiveIn(TRI.getExec());
+    PadBlock->sortUniqueLiveIns();
+    auto InsertPt = PadBlock->getFirstTerminator();
+    for (unsigned I = 0; I != Amount; ++I)
+      BuildMI(*PadBlock, InsertPt, DL, TII.get(AMDGPU::BUFFER_INV)).addImm(0);
+  }
+  return !EdgePadding.empty();
+}
+
 bool SIInsertWaitcntsLegacy::runOnMachineFunction(MachineFunction &MF) {
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   auto &PDT =
       getAnalysis<MachinePostDominatorTreeWrapperPass>().getPostDomTree();
+  auto *MDTWrapper = getAnalysisIfAvailable<MachineDominatorTreeWrapperPass>();
+  MachineDominatorTree *MDT = MDTWrapper ? &MDTWrapper->getDomTree() : nullptr;
   AliasAnalysis *AA = nullptr;
   if (auto *AAR = getAnalysisIfAvailable<AAResultsWrapperPass>())
     AA = &AAR->getAAResults();
 
-  return SIInsertWaitcnts(MLI, PDT, AA, MF).run();
+  return SIInsertWaitcnts(MLI, PDT, MDT, AA, MF).run();
 }
 
 PreservedAnalyses
@@ -3486,15 +3723,19 @@ SIInsertWaitcntsPass::run(MachineFunction &MF,
                           MachineFunctionAnalysisManager &MFAM) {
   auto &MLI = MFAM.getResult<MachineLoopAnalysis>(MF);
   auto &PDT = MFAM.getResult<MachinePostDominatorTreeAnalysis>(MF);
+  auto *MDT = MFAM.getCachedResult<MachineDominatorTreeAnalysis>(MF);
   auto *AA = MFAM.getResult<FunctionAnalysisManagerMachineFunctionProxy>(MF)
                  .getManager()
                  .getCachedResult<AAManager>(MF.getFunction());
 
-  if (!SIInsertWaitcnts(MLI, PDT, AA, MF).run())
+  if (!SIInsertWaitcnts(MLI, PDT, MDT, AA, MF).run())
     return PreservedAnalyses::all();
 
   return getMachineFunctionPassPreservedAnalyses()
-      .preserveSet<CFGAnalyses>()
+      .preserve<MachineDominatorTreeAnalysis>()
+      .preserve<MachineLoopAnalysis>()
+      .preserve<MachinePostDominatorTreeAnalysis>()
+      .preserve<MachineBranchProbabilityAnalysis>()
       .preserve<AAManager>();
 }
 
@@ -3521,6 +3762,15 @@ bool SIInsertWaitcnts::run() {
   }
 
   SmemAccessCounter = getCounterFromEvent(HWEvents::SMEM_ACCESS);
+
+  // BUFFER_INV 0 is the only supported padding operation. Force-zero debugging
+  // suppresses overlap and would require additional waits before virtual pads.
+  bool SelectPadding =
+      ST.hasBufferInvInst() && !WCG->isOptNone() && !ForceEmitZeroFlag;
+  if (SelectPadding) {
+    AsyncmarkPaddingHeaders = findAsyncmarkPaddingHeaders(MF);
+    SelectPadding = !AsyncmarkPaddingHeaders.empty();
+  }
 
   bool Modified = false;
 
@@ -3613,18 +3863,31 @@ bool SIInsertWaitcnts::run() {
       Modified |= insertWaitcntInBlock(MF, *MBB, *Brackets);
       BI.Dirty = false;
 
-      if (Brackets->hasPendingEvent()) {
+      if (Brackets->hasPendingEvent() || SelectPadding ||
+          !EdgePadding.empty()) {
         BlockInfo *MoveBracketsToSucc = nullptr;
         for (MachineBasicBlock *Succ : MBB->successors()) {
           auto *SuccBII = BlockInfos.find(Succ);
           BlockInfo &SuccBI = SuccBII->second;
+          std::unique_ptr<WaitcntBrackets> EdgeBrackets;
+          auto PadIt = EdgePadding.find({MBB, Succ});
+          if (PadIt != EdgePadding.end()) {
+            EdgeBrackets = std::make_unique<WaitcntBrackets>(*Brackets);
+            applyCounterPadding(*EdgeBrackets, PadIt->second);
+          }
+          const WaitcntBrackets *Outgoing =
+              EdgeBrackets ? EdgeBrackets.get() : Brackets.get();
           if (!SuccBI.Incoming) {
+            if (SelectPadding)
+              SuccBI.FirstIncomingPred = MBB;
             SuccBI.Dirty = true;
             if (SuccBII <= BII) {
               LLVM_DEBUG(dbgs() << "Repeat on backedge without merge\n");
               Repeat = true;
             }
-            if (!MoveBracketsToSucc) {
+            if (EdgeBrackets) {
+              SuccBI.Incoming = std::move(EdgeBrackets);
+            } else if (!MoveBracketsToSucc) {
               MoveBracketsToSucc = &SuccBI;
             } else {
               SuccBI.Incoming = std::make_unique<WaitcntBrackets>(*Brackets);
@@ -3637,7 +3900,43 @@ bool SIInsertWaitcnts::run() {
               Succ->printName(dbgs());
               dbgs() << '\n';
             });
-            if (SuccBI.Incoming->merge(*Brackets)) {
+            // Both predecessors of a supported join must precede it in the
+            // frozen RPO. Its first incoming state then represents exactly one
+            // edge and can be padded before the join generates any waits.
+            if (SelectPadding && SuccBII > BII && SuccBI.FirstIncomingPred &&
+                BlockInfos.find(SuccBI.FirstIncomingPred) < SuccBII &&
+                isBranchPaddingEligible(*Succ)) {
+              unsigned IncomingCount =
+                  SuccBI.Incoming->getOutstanding(AMDGPU::LOAD_CNT);
+              unsigned OutgoingCount =
+                  Outgoing->getOutstanding(AMDGPU::LOAD_CNT);
+              if (IncomingCount != OutgoingCount) {
+                bool PadOutgoing = OutgoingCount < IncomingCount;
+                unsigned Amount =
+                    std::min(PadOutgoing ? IncomingCount - OutgoingCount
+                                         : OutgoingCount - IncomingCount,
+                             WCG->getLimit(AMDGPU::LOAD_CNT) - 1);
+                MachineBasicBlock *PadPred =
+                    PadOutgoing ? MBB : SuccBI.FirstIncomingPred;
+                EdgePadding[{PadPred, Succ}] = Amount;
+                if (PadOutgoing) {
+                  if (!EdgeBrackets)
+                    EdgeBrackets = std::make_unique<WaitcntBrackets>(*Brackets);
+                  applyCounterPadding(*EdgeBrackets, Amount);
+                  Outgoing = EdgeBrackets.get();
+                } else {
+                  applyCounterPadding(*SuccBI.Incoming, Amount);
+                }
+                LLVM_DEBUG({
+                  dbgs() << "Waitcnt branch padding: ";
+                  PadPred->printName(dbgs());
+                  dbgs() << " -> ";
+                  Succ->printName(dbgs());
+                  dbgs() << " by " << Amount << '\n';
+                });
+              }
+            }
+            if (SuccBI.Incoming->merge(*Outgoing)) {
               SuccBI.Dirty = true;
               if (SuccBII <= BII) {
                 LLVM_DEBUG(dbgs() << "Repeat on backedge with merge\n");
@@ -3650,9 +3949,13 @@ bool SIInsertWaitcnts::run() {
           MoveBracketsToSucc->Incoming = std::move(Brackets);
       }
     }
+    // Loop-carried hazards may change the benefit of this first-sweep choice,
+    // but subsequent sweeps analyze the same padded program for correctness.
+    SelectPadding = false;
   } while (Repeat);
 
   Modified |= WCG->eraseDeferredWaitcnts();
+  Modified |= materializeCounterPadding();
 
   if (ST.hasScalarStores()) {
     SmallVector<MachineBasicBlock *, 4> EndPgmBlocks;
