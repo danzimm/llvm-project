@@ -108,6 +108,7 @@ FunctionPass *createSILowerI1CopiesLegacyPass();
 FunctionPass *createSIShrinkInstructionsLegacyPass();
 FunctionPass *createSIMemoryLegalizerPass();
 FunctionPass *createSIInsertWaitcntsPass();
+FunctionPass *createSIInsertAsyncmarkPaddingPass();
 
 FunctionPass *createAMDGPUImageIntrinsicOptimizerPass(const TargetMachine *);
 ModulePass *createAMDGPURemoveIncompatibleFunctionsPass(const TargetMachine *);
@@ -493,6 +494,13 @@ public:
                         MachineFunctionAnalysisManager &MFAM);
 };
 
+class SIInsertAsyncmarkPaddingPass
+    : public OptionalPassInfoMixin<SIInsertAsyncmarkPaddingPass> {
+public:
+  PreservedAnalyses run(MachineFunction &MF,
+                        MachineFunctionAnalysisManager &MFAM);
+};
+
 class SIInsertHardClausesPass
     : public OptionalPassInfoMixin<SIInsertHardClausesPass> {
 public:
@@ -601,6 +609,9 @@ extern char &SIInsertHardClausesID;
 
 void initializeSIInsertWaitcntsLegacyPass(PassRegistry &);
 extern char &SIInsertWaitcntsID;
+
+void initializeSIInsertAsyncmarkPaddingLegacyPass(PassRegistry &);
+extern char &SIInsertAsyncmarkPaddingID;
 
 void initializeSIFormMemoryClausesLegacyPass(PassRegistry &);
 extern char &SIFormMemoryClausesID;

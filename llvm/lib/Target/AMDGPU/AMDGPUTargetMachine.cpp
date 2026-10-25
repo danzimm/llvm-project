@@ -736,6 +736,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPULowerVGPREncodingLegacyPass(*PR);
   initializeSIInsertHardClausesLegacyPass(*PR);
   initializeSIInsertWaitcntsLegacyPass(*PR);
+  initializeSIInsertAsyncmarkPaddingLegacyPass(*PR);
   initializeSIModeRegisterLegacyPass(*PR);
   initializeSIWholeQuadModeLegacyPass(*PR);
   initializeSILowerControlFlowLegacyPass(*PR);
@@ -2033,6 +2034,7 @@ void GCNPassConfig::addPreEmitPass() {
   addPass(createSIMemoryLegalizerPass());
   if (getOptLevel() > CodeGenOptLevel::None)
     addPass(&SIPostRA16BitMovFoldingLegacyID);
+  addPass(createSIInsertAsyncmarkPaddingPass());
   addPass(createSIInsertWaitcntsPass());
 
   addPass(createSIModeRegisterPass());
@@ -2789,6 +2791,7 @@ void AMDGPUCodeGenPassBuilder::addPreEmitPass(PassManagerWrapper &PMW) {
   addMachineFunctionPass(SIMemoryLegalizerPass(), PMW);
   if (TM.getOptLevel() > CodeGenOptLevel::None)
     addMachineFunctionPass(SIPostRA16BitMovFoldingPass(), PMW);
+  addMachineFunctionPass(SIInsertAsyncmarkPaddingPass(), PMW);
   addMachineFunctionPass(SIInsertWaitcntsPass(), PMW);
 
   addMachineFunctionPass(SIModeRegisterPass(), PMW);
