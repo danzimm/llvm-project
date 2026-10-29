@@ -1050,3 +1050,30 @@ to instruction memory, with the length specified by ``len``, which should be
 0-31 (1-32 chunks, units of 128 bytes).
 }];
 }
+
+//===----------------------------------------------------------------------===//
+// Wait Counter Builtins
+//===----------------------------------------------------------------------===//
+
+def DocCatAMDGPUWaitcnt : DocumentationCategory<"Wait Counter Builtins"> {
+  let Content = [{
+These builtins provide hints that influence how the backend inserts waits on
+hardware dependency counters.
+}];
+}
+
+def DocPadCounter : Documentation {
+  let Category = DocCatAMDGPUWaitcnt;
+  let Content = [{
+Optional hint that requests exactly ``count`` extra events on hardware counter
+``counter`` along the opposite edge of the branch whose arm contains the call.
+Balancing the counter histories of both arms lets waits after the join be
+relaxed. Both arguments must be compile-time constants. ``counter`` 0 selects
+the LOAD (VM) counter; no other selectors are currently defined.
+
+The hint is advisory: zero counts, unsupported selectors, counts, targets, or
+control-flow shapes are ignored rather than diagnosed. The call itself issues
+no counter event and never permits a wait to be weakened; waits are always
+computed from the instructions that are actually emitted.
+}];
+}
