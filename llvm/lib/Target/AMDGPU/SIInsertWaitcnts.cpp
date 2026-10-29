@@ -30,6 +30,7 @@
 #include "SIMachineFunctionInfo.h"
 #include "Utils/AMDGPUBaseInfo.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/CodeGen/MachineDomTreeUpdater.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachinePassManager.h"
@@ -345,6 +346,7 @@ class SIInsertWaitcnts {
   DenseMap<const Value *, MachineBasicBlock *> SLoadAddresses;
   DenseMap<MachineBasicBlock *, PreheaderFlushFlags> PreheadersToFlush;
   MachineLoopInfo &MLI;
+  MachineDominatorTree *MDT;
   MachinePostDominatorTree &PDT;
   AliasAnalysis *AA = nullptr;
   MachineFunction &MF;
@@ -385,11 +387,12 @@ public:
   bool IsExpertMode = false;
   const bool TgSplit;
 
-  SIInsertWaitcnts(MachineLoopInfo &MLI, MachinePostDominatorTree &PDT,
-                   AliasAnalysis *AA, MachineFunction &MF)
-      : MLI(MLI), PDT(PDT), AA(AA), MF(MF), ST(MF.getSubtarget<GCNSubtarget>()),
-        TII(*ST.getInstrInfo()), TRI(TII.getRegisterInfo()),
-        MRI(MF.getRegInfo()),
+  SIInsertWaitcnts(MachineLoopInfo &MLI, MachineDominatorTree *MDT,
+                   MachinePostDominatorTree &PDT, AliasAnalysis *AA,
+                   MachineFunction &MF)
+      : MLI(MLI), MDT(MDT), PDT(PDT), AA(AA), MF(MF),
+        ST(MF.getSubtarget<GCNSubtarget>()), TII(*ST.getInstrInfo()),
+        TRI(TII.getRegisterInfo()), MRI(MF.getRegInfo()),
         TgSplit(ST.hasTgSplitSupport() &&
                 AMDGPU::isTgSplitEnabled(MF.getFunction())) {}
 
@@ -434,6 +437,9 @@ public:
   }
 
   bool isVmemAccess(const MachineInstr &MI) const;
+  std::optional<std::pair<MachineBasicBlock *, MachineBasicBlock *>>
+  getCounterPaddingEdge(MachineBasicBlock &Arm) const;
+  bool expandCounterPaddingHints();
   bool generateWaitcntInstBefore(MachineInstr &MI,
                                  WaitcntBrackets &ScoreBrackets,
                                  MachineInstr *OldWaitcntInstr,
@@ -869,9 +875,12 @@ public:
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
-    AU.setPreservesCFG();
     AU.addRequired<MachineLoopInfoWrapperPass>();
     AU.addRequired<MachinePostDominatorTreeWrapperPass>();
+    AU.addUsedIfAvailable<MachineDominatorTreeWrapperPass>();
+    AU.addPreserved<MachineLoopInfoWrapperPass>();
+    AU.addPreserved<MachineDominatorTreeWrapperPass>();
+    AU.addPreserved<MachinePostDominatorTreeWrapperPass>();
     AU.addUsedIfAvailable<AAResultsWrapperPass>();
     AU.addPreserved<AAResultsWrapperPass>();
     MachineFunctionPass::getAnalysisUsage(AU);
@@ -3470,31 +3479,139 @@ SIInsertWaitcnts::getPreheaderFlushFlags(MachineLoop *ML,
   return Flags;
 }
 
+std::optional<std::pair<MachineBasicBlock *, MachineBasicBlock *>>
+SIInsertWaitcnts::getCounterPaddingEdge(MachineBasicBlock &Arm) const {
+  MachineBasicBlock *Branch = Arm.getSinglePredecessor();
+  MachineBasicBlock *Join = Arm.getSingleSuccessor();
+  if (!Branch || !Join || Branch->succ_size() != 2 || Join->pred_size() != 2 ||
+      Arm.isEHPad() || Join->isEHPad())
+    return std::nullopt;
+
+  MachineBasicBlock *Other = nullptr;
+  for (MachineBasicBlock *Pred : Join->predecessors())
+    if (Pred != &Arm)
+      Other = Pred;
+  if (!Other || (Other != Branch && (Other->getSinglePredecessor() != Branch ||
+                                     Other->getSingleSuccessor() != Join)))
+    return std::nullopt;
+
+  MachineLoop *Loop = MLI.getLoopFor(Join);
+  if (MLI.getLoopFor(Branch) != Loop || MLI.getLoopFor(&Arm) != Loop ||
+      MLI.getLoopFor(Other) != Loop ||
+      (Loop && (Loop->getHeader() == Join || Loop->isLoopLatch(Join))))
+    return std::nullopt;
+
+  MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
+  SmallVector<MachineOperand, 4> Cond;
+  if (TII.analyzeBranch(*Branch, TBB, FBB, Cond) || Cond.empty())
+    return std::nullopt;
+  for (MachineBasicBlock *MBB : {&Arm, Other}) {
+    if (MBB == Branch)
+      continue;
+    for (const MachineInstr &MI : MBB->terminators())
+      if (MI.getOpcode() != AMDGPU::S_BRANCH)
+        return std::nullopt;
+  }
+  if (Other == Branch && !Other->canSplitCriticalEdge(Join, &MLI))
+    return std::nullopt;
+  return std::make_pair(Other, Join);
+}
+
+bool SIInsertWaitcnts::expandCounterPaddingHints() {
+  struct Request {
+    MachineBasicBlock *Branch;
+    MachineBasicBlock *Pred;
+    MachineBasicBlock *Join;
+    unsigned Count;
+    DebugLoc DL;
+  };
+  SmallVector<Request, 8> Requests;
+  DenseSet<MachineBasicBlock *> SeenBranches, RepeatedBranches;
+  bool Modified = false;
+  bool Enabled = ST.hasBufferInvInst() && !WCG->isOptNone();
+  for (MachineBasicBlock &MBB : MF) {
+    for (MachineInstr &MI : make_early_inc_range(MBB.instrs())) {
+      if (MI.getOpcode() != AMDGPU::PAD_COUNTER)
+        continue;
+      int64_t Counter = MI.getOperand(0).getImm();
+      int64_t Count = MI.getOperand(1).getImm();
+      if (Enabled && Counter == 0 && Count > 0 &&
+          uint64_t(Count) <= WCG->getLimit(AMDGPU::LOAD_CNT) - 1) {
+        if (auto Edge = getCounterPaddingEdge(MBB)) {
+          MachineBasicBlock *Branch = MBB.getSinglePredecessor();
+          if (!SeenBranches.insert(Branch).second)
+            RepeatedBranches.insert(Branch);
+          Requests.push_back({Branch, Edge->first, Edge->second,
+                              unsigned(Count), MI.getDebugLoc()});
+        }
+      }
+      // The optional marker never supplies an event itself. Remove it even
+      // when its count, target, shape, or optimization mode is unsupported.
+      MI.eraseFromParent();
+      Modified = true;
+    }
+  }
+
+  MachineDomTreeUpdater MDTU(MDT, &PDT,
+                             MachineDomTreeUpdater::UpdateStrategy::Eager);
+  for (const Request &R : Requests) {
+    if (RepeatedBranches.contains(R.Branch))
+      continue;
+    MachineBasicBlock *PadBlock = R.Pred;
+    if (R.Pred->succ_size() != 1) {
+      bool WasLayoutEdge = R.Pred->isLayoutSuccessor(R.Join);
+      MachineBasicBlock::SplitCriticalEdgeAnalyses Analyses{};
+      Analyses.MLI = &MLI;
+      PadBlock = R.Pred->SplitCriticalEdge(R.Join, Analyses, &MDTU);
+      if (!PadBlock)
+        continue;
+      PadBlock->setSectionID(R.Pred->getSectionID());
+      if (!WasLayoutEdge) {
+        // The splitter repairs branches for its initial layout. Move a taken
+        // edge out of line and repair the predecessor's fallthrough again.
+        MF.splice(MF.end(), PadBlock);
+        R.Pred->updateTerminator(PadBlock);
+      }
+    }
+    PadBlock->addLiveIn(TRI.getExec());
+    PadBlock->sortUniqueLiveIns();
+    auto InsertPt = PadBlock->getFirstTerminator();
+    for (unsigned I = 0; I != R.Count; ++I)
+      BuildMI(*PadBlock, InsertPt, R.DL, TII.get(AMDGPU::BUFFER_INV)).addImm(0);
+  }
+  return Modified;
+}
+
 bool SIInsertWaitcntsLegacy::runOnMachineFunction(MachineFunction &MF) {
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
+  auto *MDTWrapper = getAnalysisIfAvailable<MachineDominatorTreeWrapperPass>();
+  MachineDominatorTree *MDT = MDTWrapper ? &MDTWrapper->getDomTree() : nullptr;
   auto &PDT =
       getAnalysis<MachinePostDominatorTreeWrapperPass>().getPostDomTree();
   AliasAnalysis *AA = nullptr;
   if (auto *AAR = getAnalysisIfAvailable<AAResultsWrapperPass>())
     AA = &AAR->getAAResults();
 
-  return SIInsertWaitcnts(MLI, PDT, AA, MF).run();
+  return SIInsertWaitcnts(MLI, MDT, PDT, AA, MF).run();
 }
 
 PreservedAnalyses
 SIInsertWaitcntsPass::run(MachineFunction &MF,
                           MachineFunctionAnalysisManager &MFAM) {
   auto &MLI = MFAM.getResult<MachineLoopAnalysis>(MF);
+  auto *MDT = MFAM.getCachedResult<MachineDominatorTreeAnalysis>(MF);
   auto &PDT = MFAM.getResult<MachinePostDominatorTreeAnalysis>(MF);
   auto *AA = MFAM.getResult<FunctionAnalysisManagerMachineFunctionProxy>(MF)
                  .getManager()
                  .getCachedResult<AAManager>(MF.getFunction());
 
-  if (!SIInsertWaitcnts(MLI, PDT, AA, MF).run())
+  if (!SIInsertWaitcnts(MLI, MDT, PDT, AA, MF).run())
     return PreservedAnalyses::all();
 
   return getMachineFunctionPassPreservedAnalyses()
-      .preserveSet<CFGAnalyses>()
+      .preserve<MachineLoopAnalysis>()
+      .preserve<MachineDominatorTreeAnalysis>()
+      .preserve<MachinePostDominatorTreeAnalysis>()
       .preserve<AAManager>();
 }
 
@@ -3522,7 +3639,10 @@ bool SIInsertWaitcnts::run() {
 
   SmemAccessCounter = getCounterFromEvent(HWEvents::SMEM_ACCESS);
 
-  bool Modified = false;
+  // Materialize accepted hints before taking any entry/exit score snapshots.
+  // The ordinary solver therefore sees every real counter event from its
+  // first sweep, including loop-carried and original ordering requirements.
+  bool Modified = expandCounterPaddingHints();
 
   MachineBasicBlock &EntryBB = MF.front();
 
