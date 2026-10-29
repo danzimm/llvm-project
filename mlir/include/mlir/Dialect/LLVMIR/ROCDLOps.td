@@ -813,6 +813,27 @@ def ROCDL_IglpOpt : ROCDL_ConcreteNonMemIntrOp<"iglp.opt", [], 0, [0], ["variant
   }];
 }
 
+def ROCDL_PadCounterOp
+  : ROCDL_ConcreteNonMemIntrOp<"pad.counter", [], 0, [0, 1],
+      ["counter", "count"]>,
+    Arguments<(ins I32Attr:$counter, I32Attr:$count)> {
+  let assemblyFormat = "$counter `,` $count attr-dict";
+  let summary = "optional exact-count hint to pad the opposite branch arm";
+  let description = [{
+    Requests exactly `count` extra counter events on the opposite edge of a
+    supported triangle or diamond. Counter 0 selects LOAD/VM. The hint itself
+    issues no event and does not authorize weaker waits.
+
+    Both arguments are immediate attributes. The operation lowers to
+    `llvm.amdgcn.pad.counter`.
+
+    Example:
+    ```mlir
+    rocdl.pad.counter 0, 1
+    ```
+  }];
+}
+
 //===---------------------------------------------------------------------===//
 // Xdlops intrinsics
 
