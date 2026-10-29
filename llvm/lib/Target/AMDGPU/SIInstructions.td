@@ -583,6 +583,22 @@ def IGLP_OPT : SPseudoInstSI<(outs), (ins i32imm:$mask),
   let isMeta = 1;
 }
 
+// An advisory branch-arm hint. SIInsertWaitcnts removes it and, for a supported
+// request, emits real counter events on the opposite edge before analysis.
+def PAD_COUNTER : SPseudoInstSI<(outs),
+  (ins i32imm:$counter, i32imm:$count),
+  [(int_amdgcn_pad_counter (i32 timm:$counter), (i32 timm:$count))]> {
+  let SchedRW = [];
+  let hasNoSchedulingInfo = 1;
+  let hasSideEffects = 1;
+  let mayLoad = 0;
+  let mayStore = 0;
+  let isConvergent = 1;
+  let FixedSize = 1;
+  let Size = 0;
+  let isMeta = 1;
+}
+
 // SI pseudo instructions. These are used by the CFG structurizer pass
 // and should be lowered to ISA instructions prior to codegen.
 

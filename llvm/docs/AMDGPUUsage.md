@@ -2612,6 +2612,12 @@ The AMDGPU backend implements the following LLVM IR intrinsics.
     The iglp_opt intrinsic cannot be combined with sched_barrier or sched_group_barrier.
 
     The iglp_opt strategy implementations are subject to change.
+* - llvm.amdgcn.pad.counter
+  - Optional exact-count hint to add counter events on the opposite edge of a supported single-block triangle or diamond arm. Both i32 arguments are immediate: counter 0 selects LOAD/VM and count selects the exact number of extra events. The current implementation emits BUFFER_INV 0 on targets supporting that instruction and accepts counts 1 through the hardware wait limit minus one (1..62 on gfx942/gfx950).
+
+    The hint itself emits no event and grants no permission to weaken a wait. Ordinary waitcnt insertion analyzes the materialized padding. Zero, invalid counts/selectors, disabled optimization, unsupported shapes/targets, and repeated valid requests for one controlling branch are ignored. Accepted requests require an unambiguous arm in the same innermost loop as its branch and join; loop-header/latch joins are excluded. Profitability and later padding removal are not automated.
+
+    Available through __builtin_amdgcn_pad_counter(counter, count) and rocdl.pad.counter.
 * - llvm.amdgcn.s.getpc
   - Provides access to the s_getpc_b64 instruction, but with the return value sign-extended from the width of the underlying PC hardware register even on processors where the s_getpc_b64 instruction returns a zero-extended value.
 * - llvm.amdgcn.implicit.buffer.ptr
