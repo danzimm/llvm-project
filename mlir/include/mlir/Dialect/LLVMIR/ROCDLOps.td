@@ -821,11 +821,15 @@ def ROCDL_PadCounterOp
   let summary = "optional exact-count hint to pad the opposite branch arm";
   let description = [{
     Requests exactly `count` extra counter events on the opposite edge of a
-    supported triangle or diamond. Counter 0 selects LOAD/VM. The hint itself
-    issues no event and does not authorize weaker waits.
+    supported triangle or diamond. Counter 0 selects LOAD/VM. The current
+    backend supports `BUFFER_INV 0` and accepts counts 1..62 on gfx942/gfx950.
+    Zero, invalid, unsupported, ambiguous, and repeated requests are ignored.
+    The hint itself issues no event and does not authorize weaker waits.
 
     Both arguments are immediate attributes. The operation lowers to
-    `llvm.amdgcn.pad.counter`.
+    `llvm.amdgcn.pad.counter`. `SILowerWaitPadding` materializes accepted hints
+    before ordinary waitcnt insertion analyzes the padding and preserves
+    completion and ordering requirements.
 
     Example:
     ```mlir

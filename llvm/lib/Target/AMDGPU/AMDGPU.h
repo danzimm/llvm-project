@@ -107,6 +107,7 @@ FunctionPass *createSIAnnotateControlFlowLegacyPass();
 FunctionPass *createSILowerI1CopiesLegacyPass();
 FunctionPass *createSIShrinkInstructionsLegacyPass();
 FunctionPass *createSIMemoryLegalizerPass();
+FunctionPass *createSILowerWaitPaddingPass();
 FunctionPass *createSIInsertWaitcntsPass();
 
 FunctionPass *createAMDGPUImageIntrinsicOptimizerPass(const TargetMachine *);
@@ -486,6 +487,13 @@ public:
                         MachineFunctionAnalysisManager &AM);
 };
 
+class SILowerWaitPaddingPass
+    : public RequiredPassInfoMixin<SILowerWaitPaddingPass> {
+public:
+  PreservedAnalyses run(MachineFunction &MF,
+                        MachineFunctionAnalysisManager &MFAM);
+};
+
 class SIInsertWaitcntsPass
     : public RequiredPassInfoMixin<SIInsertWaitcntsPass> {
 public:
@@ -598,6 +606,9 @@ extern char &AMDGPULowerVGPREncodingLegacyID;
 
 void initializeSIInsertHardClausesLegacyPass(PassRegistry &);
 extern char &SIInsertHardClausesID;
+
+void initializeSILowerWaitPaddingLegacyPass(PassRegistry &);
+extern char &SILowerWaitPaddingID;
 
 void initializeSIInsertWaitcntsLegacyPass(PassRegistry &);
 extern char &SIInsertWaitcntsID;

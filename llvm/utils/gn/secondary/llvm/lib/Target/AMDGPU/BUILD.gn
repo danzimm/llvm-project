@@ -270,6 +270,7 @@ static_library("LLVMAMDGPUCodeGen") {
     "SILowerControlFlow.cpp",
     "SILowerI1Copies.cpp",
     "SILowerSGPRSpills.cpp",
+    "SILowerWaitPadding.cpp",
     "SILowerWWMCopies.cpp",
     "SIMachineFunctionInfo.cpp",
     "SIMachineScheduler.cpp",
