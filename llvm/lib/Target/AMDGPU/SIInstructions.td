@@ -579,8 +579,9 @@ def IGLP_OPT : SPseudoInstSI<(outs), (ins i32imm:$mask),
   let isMeta = 1;
 }
 
-// An advisory branch-arm hint for llvm.amdgcn.pad.counter. The hint itself
-// emits no code.
+// An advisory branch-arm hint for llvm.amdgcn.pad.counter. When padding is
+// enabled, waitcnt insertion replaces it with padding for a supported request;
+// otherwise it is dropped at emission.
 def PAD_COUNTER : SPseudoInstSI<(outs),
   (ins i32imm:$counter, i32imm:$count),
   [(int_amdgcn_pad_counter (i32 timm:$counter), (i32 timm:$count))]> {
