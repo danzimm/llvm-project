@@ -9,6 +9,8 @@
 #ifndef LLVM_LIB_TARGET_AMDGPU_SIWAITCNTPADDING_H
 #define LLVM_LIB_TARGET_AMDGPU_SIWAITCNTPADDING_H
 
+#include "AMDGPUHWEvents.h"
+
 namespace llvm {
 
 class MachineDominatorTree;
@@ -29,13 +31,15 @@ struct CounterPaddingResult {
 
 /// Remove every PAD_WAITCNT hint in \p MF and materialize the padding requested
 /// by supported hints, so that waitcnt insertion analyzes it like any other
-/// counter event. The subtarget must support padding. \p MLI, \p PDT and, if
-/// non-null, \p MDT are kept up to date.
-CounterPaddingResult expandCounterPaddingHints(MachineFunction &MF,
-                                               MachineLoopInfo &MLI,
-                                               MachineDominatorTree *MDT,
-                                               MachinePostDominatorTree &PDT,
-                                               const HardwareLimits &Limits);
+/// counter event. Branches whose asyncmark history predicts that a later async
+/// wait can select an inherited checkpoint across the join are also padded
+/// without a hint. \p LoadEvents are the events counted by the LOAD counter.
+/// The subtarget must support padding. \p MLI, \p PDT and, if non-null, \p MDT
+/// are kept up to date.
+CounterPaddingResult expandCounterPaddingHints(
+    MachineFunction &MF, MachineLoopInfo &MLI, MachineDominatorTree *MDT,
+    MachinePostDominatorTree &PDT, const HardwareLimits &Limits,
+    HWEvents LoadEvents, bool IsExpertMode, bool TgSplit);
 
 } // namespace AMDGPU
 } // namespace llvm

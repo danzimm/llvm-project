@@ -3654,8 +3654,9 @@ bool SIInsertWaitcnts::run() {
   // padding is skipped or unsupported, hints stay as meta instructions.
   bool Modified = false;
   if (!SkipPadding && ST.hasBufferInvInst()) {
-    AMDGPU::CounterPaddingResult Padding =
-        AMDGPU::expandCounterPaddingHints(MF, MLI, MDT, PDT, Limits);
+    AMDGPU::CounterPaddingResult Padding = AMDGPU::expandCounterPaddingHints(
+        MF, MLI, MDT, PDT, Limits, getWaitEvents(AMDGPU::LOAD_CNT),
+        IsExpertMode, TgSplit);
     ChangedCFG |= Padding.ChangedCFG;
     Modified |= Padding.Changed;
   }
