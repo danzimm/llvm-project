@@ -168,6 +168,7 @@ def ROCDL_Dialect : Dialect {
      "::mlir::BoolAttr":$sramecc,
      // Correspond to LLVM metadata of the same name
      "::mlir::UnitAttr":$last_use,
+     "::mlir::UnitAttr":$balance_waits,
      "::mlir::UnitAttr":$no_remote_memory,
      "::mlir::UnitAttr":$no_fine_grained_memory,
      // Deprecated: use `ignore_denormal_mode` on `llvm.atomicrmw` instead.

@@ -248,6 +248,11 @@ public:
       for (llvm::Instruction *i : instructions)
         i->setMetadata("amdgpu.last.use", llvm::MDNode::get(llvmContext, {}));
     }
+    if (dialect->getBalanceWaitsAttrHelper().getName() == attribute.getName()) {
+      for (llvm::Instruction *i : instructions)
+        i->setMetadata("amdgpu.balance.waits",
+                       llvm::MDNode::get(llvmContext, {}));
+    }
     if (dialect->getNoRemoteMemoryAttrHelper().getName() ==
         attribute.getName()) {
       for (llvm::Instruction *i : instructions)

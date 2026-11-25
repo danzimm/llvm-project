@@ -3195,6 +3195,39 @@ arguments.
 %val = load i32, ptr %in, align 4, !amdgpu.last.use !{}
 ```
 
+(amdgpu_balance_waits)=
+
+### '`amdgpu.balance.waits`' Metadata
+
+An optional performance hint on a memory operation (a load, a store or a
+memory intrinsic) that is conditionally executed. It asks the backend to
+balance the wait counter events of the operation on the opposite edge of the
+conditional branch guarding it. Without balancing, a wait after the join has to
+assume the operation was not executed, and thus also waits for operations issued
+before the branch. With balancing, the annotated operation can be left
+outstanding past the join instead. This takes no arguments.
+
+```llvm
+br i1 %cond, label %then, label %join
+
+then:
+  %val = load i32, ptr addrspace(1) %in, align 4, !amdgpu.balance.waits !{}
+  br label %join
+```
+
+Each machine instruction the annotated operation is lowered to adds one counter
+event on the opposite edge, so the amount of padding follows the actual lowering
+of the operation. To balance less, annotate fewer operations.
+
+The hint never weakens a wait. It may be dropped by optimizations, and it is
+ignored for functions that are not optimized and for unsupported targets or
+control flow. The current implementation:
+
+- Only balances LOAD/VM counter events, by emitting `BUFFER_INV 0` on targets
+  supporting that instruction.
+- Only supports an annotated operation in a single-block arm of a triangle or
+  diamond. The opposite edge of a triangle is split to hold the padding.
+
 ### '`amdgpu.no.remote.memory`' Metadata
 
 Asserts a memory operation does not access bytes in host memory, or

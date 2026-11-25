@@ -75,6 +75,11 @@ static const MachineMemOperand::Flags MOCFSB0 =
 static const MachineMemOperand::Flags MOCFSB1 =
     MachineMemOperand::MOTargetFlag6;
 
+/// Mark the MMO of a memory access whose wait counter events should be
+/// balanced on the opposite edge of the conditional branch guarding it.
+static const MachineMemOperand::Flags MOBalanceWaits =
+    MachineMemOperand::MOTargetFlag7;
+
 /// Utility to store machine instructions worklist.
 struct SIInstrWorklist {
   SIInstrWorklist() = default;

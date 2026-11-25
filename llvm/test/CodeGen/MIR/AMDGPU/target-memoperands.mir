@@ -70,3 +70,17 @@ body: |
     %0:_(p4) = COPY $sgpr0_sgpr1
     %1:_(s32) = G_LOAD %0 :: ("amdgpu-cfs0" "amdgpu-cfs1" load (s32))
 ...
+
+---
+name: target_memoperands_balance_waits
+body: |
+  bb.0:
+    liveins: $sgpr0_sgpr1
+    ; CHECK-LABEL: name: target_memoperands_balance_waits
+    ; CHECK: liveins: $sgpr0_sgpr1
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: [[COPY:%[0-9]+]]:_(p4) = COPY $sgpr0_sgpr1
+    ; CHECK-NEXT: [[LOAD:%[0-9]+]]:_(s32) = G_LOAD [[COPY]](p4) :: ("amdgpu-balance-waits" load (s32))
+    %0:_(p4) = COPY $sgpr0_sgpr1
+    %1:_(s32) = G_LOAD %0 :: ("amdgpu-balance-waits" load (s32))
+...

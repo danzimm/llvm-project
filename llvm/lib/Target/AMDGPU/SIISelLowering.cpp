@@ -21617,6 +21617,8 @@ SITargetLowering::getTargetMMOFlags(const Instruction &I) const {
     Flags |= MONoClobber;
   if (I.getMetadata("amdgpu.last.use"))
     Flags |= MOLastUse;
+  if (I.getMetadata("amdgpu.balance.waits"))
+    Flags |= MOBalanceWaits;
   if (MDNode *N = I.getMetadata("amdgpu.cfs")) {
     const ConstantAsMetadata *CAM = cast<ConstantAsMetadata>(N->getOperand(0));
     ConstantInt *CI = cast<ConstantInt>(CAM->getValue());

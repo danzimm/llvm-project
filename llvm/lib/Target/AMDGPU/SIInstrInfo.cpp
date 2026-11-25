@@ -10788,7 +10788,8 @@ SIInstrInfo::getSerializableMachineMemOperandTargetFlags() const {
           {MOThreadPrivate, "amdgpu-thread-private"},
           {MOCFSB0, "amdgpu-cfs0"},
           {MOCFSB1, "amdgpu-cfs1"},
-  };
+          {MOBalanceWaits, "amdgpu-balance-waits"},
+      };
 
   return ArrayRef(TargetFlags);
 }

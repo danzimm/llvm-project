@@ -1992,6 +1992,15 @@ llvm.func @rocdl_last_use(%ptr: !llvm.ptr<1>) -> i32 {
   llvm.return %ret : i32
 }
 
+llvm.func @rocdl_balance_waits(%ptr: !llvm.ptr<1>) -> i32 {
+  // CHECK-LABEL: @rocdl_balance_waits
+  // CHECK: %[[ret:.+]] = load
+  // CHECK-SAME: !amdgpu.balance.waits
+  // CHECK: ret i32 %[[ret]]
+  %ret = llvm.load %ptr {rocdl.balance_waits} : !llvm.ptr<1> -> i32
+  llvm.return %ret : i32
+}
+
 llvm.func @test_fmed3_f16(%arg0: f16, %arg1: f16, %arg2: f16) -> f16 {
   // CHECK-LABEL: define half @test_fmed3_f16(half %0, half %1, half %2)
   %0 = rocdl.fmed3 %arg0, %arg1, %arg2 : f16
